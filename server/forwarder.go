@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"errors"
 	"net"
 	"net/netip"
 	"strings"
@@ -106,6 +105,9 @@ func (s *Forwarder) Serve() (err error) {
 			for {
 				conn, err := s.tcpListener.Accept()
 				if err != nil {
+					if isGracefulStopError(ctx, err) {
+						return nil
+					}
 					return err
 				}
 				select {
@@ -127,8 +129,7 @@ func (s *Forwarder) Serve() (err error) {
 					}
 					s.Logger.Info().Msgf("Forward %v <-tcp-> %v", lConn.RemoteAddr().String(), s.RemoteAddr)
 					if err := s.relay.RelayTCP(lConn, rConn); err != nil {
-						var netError net.Error
-						if errors.As(err, &netError) && netError.Timeout() {
+						if isNetTimeoutError(err) {
 							return // ignore i/o timeout
 						}
 						s.Logger.Warn().
@@ -160,6 +161,9 @@ func (s *Forwarder) Serve() (err error) {
 			for {
 				n, addr, err := s.udpListener.ReadFromUDPAddrPort(buf)
 				if err != nil {
+					if isGracefulStopError(ctx, err) {
+						return nil
+					}
 					return err
 				}
 				select {
@@ -169,9 +173,10 @@ func (s *Forwarder) Serve() (err error) {
 				}
 				newBuf := pool.Get(n)
 				copy(newBuf, buf[:n])
-				go func(buf pool.PB, lAddr netip.AddrPort) {
+				go func(buf pool.PB, lAddr netip.AddrPort, source netip.AddrPort) {
 					defer buf.Put()
 					endpoint, isNew, err := s.udpEndpointPool.GetOrCreate(lAddr, &UdpEndpointOptions{
+						Context: ctx,
 						Handler: func(data []byte, from netip.AddrPort, metadata any) error {
 							_, err := s.udpListener.WriteToUDPAddrPort(data, lAddr)
 							return err
@@ -193,7 +198,7 @@ func (s *Forwarder) Serve() (err error) {
 						return
 					}
 					if isNew {
-						s.Logger.Info().Msgf("Forward %v <-udp-> %v", addr.String(), s.RemoteAddr)
+						s.Logger.Info().Msgf("Forward %v <-udp-> %v", source.String(), s.RemoteAddr)
 					}
 					if _, err = endpoint.WriteTo(buf, s.RemoteAddr); err != nil {
 						s.Logger.Info().
@@ -203,7 +208,7 @@ func (s *Forwarder) Serve() (err error) {
 							Msg("Failed to write UDP data")
 						return
 					}
-				}(newBuf, addr)
+				}(newBuf, addr, addr)
 			}
 		})
 	}

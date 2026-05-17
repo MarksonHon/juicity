@@ -78,6 +78,18 @@ func (a *Arguments) GetConfig() (*config.Config, error) {
 	return conf, nil
 }
 
+func (a *Arguments) GetConfigAndLogger() (*config.Config, *log.Logger, error) {
+	conf, err := a.GetConfig()
+	if err != nil {
+		return nil, nil, err
+	}
+	logger, err := a.GetLogger(conf.LogLevel)
+	if err != nil {
+		return nil, nil, err
+	}
+	return conf, logger, nil
+}
+
 func InitArgumentsFlags(cmd *cobra.Command) {
 	// flags
 	cmd.PersistentFlags().StringVarP(&defaultArguments.CfgFile, "config", "c", "", "specify config file path")

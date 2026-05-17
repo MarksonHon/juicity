@@ -10,22 +10,24 @@ import (
 func init() {
 	soMark := netproxy.SoMark
 	netproxy.SoMark = func(fd, mark int) error {
-		if protectPath == "" {
+		path := currentProtectPath()
+		if path == "" {
 			return soMark(fd, mark)
 		}
-		if err := protect(fd, protectPath); err != nil {
+		if err := protect(fd, path); err != nil {
 			return fmt.Errorf("protect failed: %w", err)
 		}
 		return nil
 	}
 	soMarkControl := netproxy.SoMarkControl
 	netproxy.SoMarkControl = func(c syscall.RawConn, mark int) error {
-		if protectPath == "" {
+		path := currentProtectPath()
+		if path == "" {
 			return soMarkControl(c, mark)
 		}
 		var sockOptErr error
 		controlErr := c.Control(func(fd uintptr) {
-			err := protect(int(fd), protectPath)
+			err := protect(int(fd), path)
 			if err != nil {
 				sockOptErr = fmt.Errorf("error setting SO_MARK socket option: %w", err)
 			}

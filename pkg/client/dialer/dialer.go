@@ -3,13 +3,31 @@ package dialer
 import (
 	"context"
 	"runtime"
+	"sync"
 
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol/direct"
 	"github.com/juicity/juicity/config"
 )
 
-var protectPath string
+var (
+	protectPathMu sync.RWMutex
+	protectPath   string
+	protectDialMu sync.Mutex
+)
+
+func setProtectPath(path string) {
+	protectPathMu.Lock()
+	protectPath = path
+	protectPathMu.Unlock()
+}
+
+func currentProtectPath() string {
+	protectPathMu.RLock()
+	path := protectPath
+	protectPathMu.RUnlock()
+	return path
+}
 
 type clientDialer struct {
 	Dialer netproxy.Dialer
@@ -26,9 +44,12 @@ func NewClientDialer(conf *config.Config) *clientDialer {
 // DialContext implements netproxy.Dialer.
 func (c *clientDialer) DialContext(ctx context.Context, network string, addr string) (netproxy.Conn, error) {
 	if runtime.GOOS == "android" || runtime.GOOS == "linux" {
-		protectPath = c.conf.ProtectPath
-		if protectPath != "" {
+		if c.conf.ProtectPath != "" {
 			// Use SoMark func
+			protectDialMu.Lock()
+			defer protectDialMu.Unlock()
+			setProtectPath(c.conf.ProtectPath)
+			defer setProtectPath("")
 			magicNetwork := netproxy.MagicNetwork{
 				Network: "udp",
 				Mark:    114514,

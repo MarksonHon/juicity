@@ -15,17 +15,14 @@ var (
 		Use:                   "generate-certchain-hash [fullchain_file]",
 		DisableFlagsInUseLine: true,
 		Short:                 "To generate the hash of a full chain certificate.",
-		Run: func(cmd *cobra.Command, args []string) {
-			if len(args) == 0 {
-				_ = cmd.Help()
-				os.Exit(1)
-			}
+		Args:                  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
 			hash, err := generateCertChainHash(args[0])
 			if err != nil {
-				fmt.Println(err)
-				os.Exit(0)
+				return err
 			}
 			fmt.Println(hash)
+			return nil
 		},
 	}
 )

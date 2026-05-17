@@ -83,7 +83,7 @@ func NewLogger(opt *Options) *Logger {
 	if opt.TimeFormat != "" {
 		logger = logger.With().Timestamp().Logger()
 	}
-	logger.Level(zerolog.DebugLevel)
+	logger = logger.Level(zerolog.InfoLevel)
 
 	return &logger
 }

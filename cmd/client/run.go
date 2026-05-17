@@ -7,11 +7,10 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"github.com/daeuniverse/outbound/protocol"
@@ -28,6 +27,11 @@ import (
 	"github.com/juicity/juicity/server"
 )
 
+const (
+	quicGoDisableGSOEnv   = "QUIC_GO_DISABLE_GSO"
+	quicGoDisableGSOValue = "1"
+)
+
 var (
 	logger = log.NewLogger(&log.Options{
 		TimeFormat: time.DateTime,
@@ -36,44 +40,31 @@ var (
 	runCmd = &cobra.Command{
 		Use:   "run",
 		Short: "To run juicity-client in the foreground.",
-		Run: func(cmd *cobra.Command, args []string) {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			// TODO: Some users reported that enabling GSO on the client would affect the performance of watching YouTube, so we disabled it by default.
-			if _, ok := os.LookupEnv("QUIC_GO_DISABLE_GSO"); !ok {
-				os.Setenv("QUIC_GO_DISABLE_GSO", "1")
+			if _, ok := os.LookupEnv(quicGoDisableGSOEnv); !ok {
+				os.Setenv(quicGoDisableGSOEnv, quicGoDisableGSOValue)
 			}
 			arguments := shared.GetArguments()
-			// Config.
-			conf, err := arguments.GetConfig()
+			conf, runLogger, err := arguments.GetConfigAndLogger()
 			if err != nil {
-				logger.Fatal().
-					Err(err).
-					Msg("Failed to read config")
+				return err
 			}
+			if err = conf.ValidateForClientRun(); err != nil {
+				return fmt.Errorf("invalid client config: %w", err)
+			}
+			logger = runLogger
 
-			// Logger.
-			if logger, err = arguments.GetLogger(conf.LogLevel); err != nil {
-				logger.Fatal().
-					Err(err).
-					Msg("Failed to init logger")
-			}
 			gliderLog.SetLogger(logger)
 
-			go func() {
-				if err := Serve(conf); err != nil {
-					logger.Fatal().Err(err).Send()
-				}
-			}()
-			sigs := make(chan os.Signal, 1)
-			signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT, syscall.SIGILL)
-			for sig := range sigs {
-				logger.Warn().Str("signal", sig.String()).Msg("Exiting")
-				return
-			}
+			return shared.RunWithSignalCancel(logger, func(ctx context.Context) error {
+				return Serve(ctx, conf)
+			})
 		},
 	}
 )
 
-func Serve(conf *config.Config) error {
+func Serve(ctx context.Context, conf *config.Config) error {
 	if conf.Sni == "" {
 		conf.Sni, _, _ = net.SplitHostPort(conf.Server)
 	}
@@ -115,10 +106,8 @@ func Serve(conf *config.Config) error {
 		return err
 	}
 	if conf.Listen == "" && len(conf.Forward) == 0 {
-		logger.Fatal().Msg("Please fill in at least one of `listen` and `forward` in the config file.")
+		return fmt.Errorf("please fill in at least one of `listen` and `forward` in the config file")
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	wg := pool.New().WithErrors().WithContext(ctx).WithCancelOnError()
 	if conf.Listen != "" {
 		s, err := server.NewMixed("mixed://"+conf.Listen, d)
@@ -126,17 +115,7 @@ func Serve(conf *config.Config) error {
 			return err
 		}
 		wg.Go(func(ctx context.Context) error {
-			ch := make(chan struct{}, 1)
-			go func() {
-				s.ListenAndServe()
-				ch <- struct{}{}
-			}()
-			select {
-			case <-ch:
-				return fmt.Errorf("ListenAndServe: unexpected error")
-			case <-ctx.Done():
-				return nil
-			}
+			return runServiceWithContext(ctx, s.ListenAndServe, s.Close)
 		})
 	}
 	if len(conf.Forward) != 0 {
@@ -150,21 +129,44 @@ func Serve(conf *config.Config) error {
 			if err != nil {
 				return err
 			}
-			wg.Go(func(ctx context.Context) (err error) {
-				ch := make(chan error, 1)
-				go func() {
-					ch <- forwarder.Serve()
-				}()
-				select {
-				case err := <-ch:
-					return err
-				case <-ctx.Done():
-					return nil
-				}
+			wg.Go(func(ctx context.Context) error {
+				return runServiceWithContext(ctx, forwarder.Serve, forwarder.Close)
 			})
 		}
 	}
 	return wg.Wait()
+}
+
+func runServiceWithContext(ctx context.Context, serve func() error, closeFn func() error) error {
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- serve()
+	}()
+
+	select {
+	case err := <-errCh:
+		if isGracefulStopError(ctx, err) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		_ = closeFn()
+		err := <-errCh
+		if isGracefulStopError(ctx, err) {
+			return nil
+		}
+		return err
+	}
+}
+
+func isGracefulStopError(ctx context.Context, err error) bool {
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	return ctx.Err() != nil
 }
 
 func init() {

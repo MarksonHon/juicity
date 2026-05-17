@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/juicity/juicity/common/consts"
@@ -85,15 +84,15 @@ func New(opts *Options) (*Server, error) {
 		return nil, err
 	}
 	var d netproxy.Dialer
-	uesFullconeDialer := opts.DialerLink == ""
+	useFullconeDialer := opts.DialerLink == ""
 	switch {
 	case opts.SendThrough != "":
 		lAddr, err := netip.ParseAddr(opts.SendThrough)
 		if err != nil {
 			return nil, fmt.Errorf("parse send_through: %w", err)
 		}
-		d = direct.NewDirectDialerLaddr(uesFullconeDialer, lAddr)
-	case uesFullconeDialer:
+		d = direct.NewDirectDialerLaddr(useFullconeDialer, lAddr)
+	case useFullconeDialer:
 		d = direct.FullconeDirect
 	default:
 		d = direct.SymmetricDirect
@@ -131,12 +130,17 @@ func New(opts *Options) (*Server, error) {
 }
 
 func (s *Server) Serve(addr string) (err error) {
+	return s.ServeContext(context.Background(), addr)
+}
+
+func (s *Server) ServeContext(ctx context.Context, addr string) (err error) {
 	quicMaxOpenIncomingStreams := int64(s.maxOpenIncomingStreams)
 
 	pktConn, err := net.ListenPacket("udp", addr)
 	if err != nil {
 		return err
 	}
+	defer pktConn.Close()
 	transport := quic.Transport{
 		Conn: pktConn,
 	}
@@ -150,43 +154,59 @@ func (s *Server) Serve(addr string) (err error) {
 		KeepAlivePeriod:                10 * time.Second,
 		DisablePathMTUDiscovery:        false,
 		EnableDatagrams:                false,
-		CapabilityCallback:             nil,
 	})
 	if err != nil {
 		return err
 	}
+	defer listener.Close()
+	defer transport.Close()
+
+	serveCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		<-serveCtx.Done()
+		_ = listener.Close()
+		_ = transport.Close()
+	}()
+
 	go func() {
 		buf := pool.GetFullCap(consts.EthernetMtu)
 		defer buf.Put()
 		for {
-			n, addr, err := transport.ReadNonQUICPacket(context.Background(), buf)
+			n, addr, err := transport.ReadNonQUICPacket(serveCtx, buf)
 			if err != nil {
-				s.logger.Error().
-					Err(err).
-					Send()
+				if !isGracefulStopError(serveCtx, err) {
+					s.logger.Error().
+						Err(err).
+						Msg("ReadNonQUICPacket")
+				}
 				return
 			}
 			newBuf := pool.Get(n)
-			copy(newBuf, buf)
-			go func(transport *quic.Transport, buf pool.PB, ulAddr *net.UDPAddr) {
+			copy(newBuf, buf[:n])
+			go func(ctx context.Context, transport *quic.Transport, buf pool.PB, ulAddr *net.UDPAddr) {
 				defer buf.Put()
-				if err := s.handleNonQuicPacket(transport, buf, ulAddr); err != nil {
-					s.logger.Info().
-						Err(err).
-						Send()
+				if err := s.handleNonQuicPacket(ctx, transport, buf, ulAddr); err != nil {
+					if !isGracefulStopError(ctx, err) {
+						s.logger.Info().
+							Err(err).
+							Send()
+					}
 				}
-			}(&transport, newBuf, addr.(*net.UDPAddr))
+			}(serveCtx, &transport, newBuf, addr.(*net.UDPAddr))
 		}
 	}()
 	for {
-		conn, err := listener.Accept(context.Background())
+		conn, err := listener.Accept(serveCtx)
 		if err != nil {
+			if isGracefulStopError(serveCtx, err) {
+				return nil
+			}
 			return err
 		}
 		go func(conn quic.Connection) {
-			if err := s.handleConn(conn); err != nil {
-				var netError net.Error
-				if errors.As(err, &netError) && netError.Timeout() {
+			if err := s.handleConn(serveCtx, conn); err != nil {
+				if isNetTimeoutError(err) {
 					return // ignore i/o timeout
 				}
 				s.logger.Warn().
@@ -197,13 +217,14 @@ func (s *Server) Serve(addr string) (err error) {
 	}
 }
 
-func (s *Server) handleNonQuicPacket(transport *quic.Transport, buf []byte, ulAddr *net.UDPAddr) (err error) {
+func (s *Server) handleNonQuicPacket(ctx context.Context, transport *quic.Transport, buf []byte, ulAddr *net.UDPAddr) (err error) {
 	if len(buf) < juicity.CipherConf.SaltLen {
-		return fmt.Errorf("insuffient [underlay] data: len %v", len(buf))
+		return fmt.Errorf("insufficient [underlay] data: len %v", len(buf))
 	}
 	lAddr := ulAddr.AddrPort()
 	// source ip/port -> dst mapping.
 	endpoint, isNew, err := s.udpEndpointPool.GetOrCreate(lAddr, &UdpEndpointOptions{
+		Context: ctx,
 		Handler: func(data []byte, from netip.AddrPort, metadata any) error {
 			masterKey := metadata.([]byte)
 			salt := pool.Get(juicity.CipherConf.SaltLen)
@@ -272,10 +293,14 @@ func (s *Server) handleNonQuicPacket(transport *quic.Transport, buf []byte, ulAd
 	return nil
 }
 
-func (s *Server) handleConn(conn quic.Connection) (err error) {
+func (s *Server) handleConn(parentCtx context.Context, conn quic.Connection) (err error) {
 	common.SetCongestionController(conn, s.congestionControl, s.cwnd)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(parentCtx)
 	defer cancel()
+	go func() {
+		<-parentCtx.Done()
+		_ = conn.CloseWithError(quic.ApplicationErrorCode(0), "")
+	}()
 	authCtx, authDone := context.WithTimeout(ctx, AuthenticateTimeout)
 	defer authDone()
 	go func() {
@@ -315,10 +340,13 @@ func (s *Server) handleConn(conn quic.Connection) (err error) {
 	for {
 		stream, err := conn.AcceptStream(ctx)
 		if err != nil {
+			if isGracefulStopError(ctx, err) {
+				return nil
+			}
 			return err
 		}
 		go func(stream quic.Stream) {
-			if err = s.handleStream(ctx, authCtx, conn, stream); err != nil {
+			if err := s.handleStream(ctx, authCtx, conn, stream); err != nil {
 				s.logger.Warn().
 					Err(err).
 					Send()
@@ -354,12 +382,11 @@ func (s *Server) handleStream(ctx context.Context, authCtx context.Context, conn
 			Network: "tcp",
 			Mark:    uint32(s.fwmark),
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), consts.DefaultDialTimeout)
+		dialCtx, cancel := context.WithTimeout(ctx, consts.DefaultDialTimeout)
 		defer cancel()
-		rConn, err := s.dialer.DialContext(ctx, magicNetwork.Encode(), target)
+		rConn, err := s.dialer.DialContext(dialCtx, magicNetwork.Encode(), target)
 		if err != nil {
-			var netErr net.Error
-			if errors.As(err, &netErr) && netErr.Timeout() {
+			if isNetTimeoutError(err) {
 				s.logger.Debug().
 					Err(err).
 					Send()
@@ -369,8 +396,7 @@ func (s *Server) handleStream(ctx context.Context, authCtx context.Context, conn
 		}
 		defer rConn.Close()
 		if err = s.relay.RelayTCP(lConn, rConn); err != nil {
-			var netErr net.Error
-			if errors.Is(err, io.EOF) || (errors.As(err, &netErr) && netErr.Timeout()) || strings.HasSuffix(err.Error(), "with error code 0") {
+			if isIgnorableRelayError(err) {
 				return nil // ignore i/o timeout
 			}
 			return fmt.Errorf("relay tcp error: %w", err)
@@ -396,16 +422,15 @@ func (s *Server) handleStream(ctx context.Context, authCtx context.Context, conn
 			Network: "udp",
 			Mark:    uint32(s.fwmark),
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), consts.DefaultDialTimeout)
+		dialCtx, cancel := context.WithTimeout(ctx, consts.DefaultDialTimeout)
 		defer cancel()
-		c, err := s.dialer.DialContext(ctx, magicNetwork.Encode(), addr.String())
+		c, err := s.dialer.DialContext(dialCtx, magicNetwork.Encode(), addr.String())
 		s.logger.Debug().
 			Str("target", addr.String()).
 			Str("source", source).
 			Msg("juicity received a [udp] request")
 		if err != nil {
-			var netErr net.Error
-			if errors.As(err, &netErr) && netErr.Timeout() {
+			if isNetTimeoutError(err) {
 				return nil // ignore i/o timeout
 			}
 			return fmt.Errorf("Dial: %w", err)
@@ -426,8 +451,7 @@ func (s *Server) handleStream(ctx context.Context, authCtx context.Context, conn
 			lConn,
 			len(buf),
 		); err != nil {
-			var netErr net.Error
-			if errors.Is(err, io.EOF) || (errors.As(err, &netErr) && netErr.Timeout()) || strings.HasSuffix(err.Error(), "with error code 0") {
+			if isIgnorableRelayError(err) {
 				return nil // ignore i/o timeout
 			}
 			return fmt.Errorf("relay udp error: %w", err)

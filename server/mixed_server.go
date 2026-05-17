@@ -1,9 +1,11 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
+	"sync"
 
 	"github.com/daeuniverse/outbound/netproxy"
 	gliderLog "github.com/nadoo/glider/pkg/log"
@@ -80,13 +82,16 @@ type Mixed struct {
 
 	httpServer   *http.HTTP
 	socks5Server *socks5.Socks5
+
+	mu       sync.Mutex
+	listener net.Listener
 }
 
 // NewMixed returns a mixed proxy.
 func NewMixed(s string, d netproxy.Dialer) (*Mixed, error) {
 	u, err := url.Parse(s)
 	if err != nil {
-		return nil, fmt.Errorf("parse err: %s", err)
+		return nil, fmt.Errorf("parse err: %w", err)
 	}
 
 	p := &forwarder{
@@ -110,26 +115,42 @@ func NewMixed(s string, d netproxy.Dialer) (*Mixed, error) {
 }
 
 // ListenAndServe listens on server's addr and serves connections.
-func (m *Mixed) ListenAndServe() {
+func (m *Mixed) ListenAndServe() error {
 	go m.socks5Server.ListenAndServeUDP()
 
 	l, err := net.Listen("tcp", m.addr)
 	if err != nil {
-		gliderLog.Fatalf("[mixed] failed to listen on %s: %v", m.addr, err)
-		return
+		return fmt.Errorf("[mixed] failed to listen on %s: %w", m.addr, err)
 	}
+	m.mu.Lock()
+	m.listener = l
+	m.mu.Unlock()
+	defer m.Close()
 
 	gliderLog.F("[mixed] http & socks5 server listening TCP on %s", m.addr)
 
 	for {
 		c, err := l.Accept()
 		if err != nil {
-			gliderLog.F("[mixed] failed to accept: %v", err)
-			continue
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			return fmt.Errorf("[mixed] failed to accept: %w", err)
 		}
 
 		go m.Serve(c)
 	}
+}
+
+func (m *Mixed) Close() error {
+	m.mu.Lock()
+	l := m.listener
+	m.listener = nil
+	m.mu.Unlock()
+	if l == nil {
+		return nil
+	}
+	return l.Close()
 }
 
 // Serve serves connections.

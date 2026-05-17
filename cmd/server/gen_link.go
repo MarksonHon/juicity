@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"time"
 
 	"github.com/juicity/juicity/cmd/internal/shared"
@@ -21,13 +20,13 @@ var (
 		Use:                   "generate-sharelink [config_file]",
 		DisableFlagsInUseLine: true,
 		Short:                 "To generate the sharelink from the config file.",
-		Run: func(cmd *cobra.Command, args []string) {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			link, err := generateLink(shared.GetArguments())
 			if err != nil {
-				fmt.Println(err)
-				os.Exit(1)
+				return err
 			}
 			fmt.Println(link)
+			return nil
 		},
 	}
 )
@@ -69,15 +68,15 @@ func generateLink(arguments shared.Arguments) (string, error) {
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 			d := net.Dialer{
-				Timeout: time.Duration(timeout) * time.Millisecond,
+				Timeout: timeout,
 			}
 			return d.DialContext(ctx, "tcp", "208.67.222.222:53")
 		},
 	}
 	addrs, _ := r.LookupHost(ctx, "myip.opendns.com")
 	if len(addrs) == 0 {
-		http.DefaultClient.Timeout = timeout
-		resp, err := http.Get("https://myipv4.p1.opendns.com/get_my_ip")
+		httpClient := &http.Client{Timeout: timeout}
+		resp, err := httpClient.Get("https://myipv4.p1.opendns.com/get_my_ip")
 		if err != nil {
 			return "", err
 		}

@@ -71,7 +71,7 @@ func (r *relay) SelectTimeout(packet []byte) time.Duration {
 	return consts.DnsQueryTimeout
 }
 
-// RelayUoT relays UDP traffict over TCP
+// RelayUoT relays UDP traffic over TCP
 func (r *relay) RelayUoT(rConn netproxy.PacketConn, lConn *juicity.PacketConn, bufLen int) (err error) {
 	eCh := make(chan error, 1)
 	go func() {

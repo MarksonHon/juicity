@@ -1,12 +1,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"math"
-	"os"
-	"os/signal"
 	"strconv"
-	"syscall"
 	"time"
 
 	"github.com/juicity/juicity/cmd/internal/shared"
@@ -25,43 +23,25 @@ var (
 	runCmd = &cobra.Command{
 		Use:   "run",
 		Short: "To run juicity-server in the foreground.",
-		Run: func(cmd *cobra.Command, args []string) {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			arguments := shared.GetArguments()
-			// Config.
-			conf, err := arguments.GetConfig()
+			conf, runLogger, err := arguments.GetConfigAndLogger()
 			if err != nil {
-				logger.Fatal().
-					Err(err).
-					Msg("Failed to read config")
+				return err
 			}
+			if err = conf.ValidateForServerRun(); err != nil {
+				return fmt.Errorf("invalid server config: %w", err)
+			}
+			logger = runLogger
 
-			// Logger.
-			if logger, err = arguments.GetLogger(conf.LogLevel); err != nil {
-				logger.Fatal().
-					Err(err).
-					Msg("Failed to init logger")
-			}
-
-			go func() {
-				if err := Serve(conf); err != nil {
-					logger.Fatal().
-						Err(err).
-						Send()
-				}
-			}()
-			sigs := make(chan os.Signal, 1)
-			signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT, syscall.SIGILL)
-			for sig := range sigs {
-				logger.Warn().
-					Str("signal", sig.String()).
-					Msg("Exiting")
-				return
-			}
+			return shared.RunWithSignalCancel(logger, func(ctx context.Context) error {
+				return Serve(ctx, conf)
+			})
 		},
 	}
 )
 
-func Serve(conf *config.Config) (err error) {
+func Serve(ctx context.Context, conf *config.Config) (err error) {
 	var fwmark uint64
 	if conf.Fwmark != "" {
 		fwmark, err = strconv.ParseUint(conf.Fwmark, 0, 32)
@@ -90,7 +70,7 @@ func Serve(conf *config.Config) (err error) {
 		return fmt.Errorf(`"Listen" is required`)
 	}
 	logger.Info().Msg("Listen at " + conf.Listen)
-	if err = s.Serve(conf.Listen); err != nil {
+	if err = s.ServeContext(ctx, conf.Listen); err != nil {
 		return err
 	}
 	return nil

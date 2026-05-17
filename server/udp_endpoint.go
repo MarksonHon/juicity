@@ -72,6 +72,7 @@ type UdpEndpointPool struct {
 	createMuMap sync.Map
 }
 type UdpEndpointOptions struct {
+	Context    context.Context
 	Handler    UdpHandler
 	NatTimeout time.Duration
 	// GetTarget is useful only if the underlay does not support Full-cone.
@@ -121,7 +122,11 @@ begin:
 		if err != nil {
 			return nil, false, err
 		}
-		ctx, cancel := context.WithTimeout(context.TODO(), consts.DefaultDialTimeout)
+		dialCtx := createOption.Context
+		if dialCtx == nil {
+			dialCtx = context.Background()
+		}
+		ctx, cancel := context.WithTimeout(dialCtx, consts.DefaultDialTimeout)
 		defer cancel()
 		udpConn, err := dialOption.Dialer.DialContext(ctx, "udp", dialOption.Target)
 		if err != nil {
