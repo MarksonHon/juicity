@@ -33,7 +33,7 @@ jobs:
       telegram_token: ${{ secrets.TELEGRAM_TOKEN }}
 
   build:
-    uses: juicity/juicity/.github/workflows/seed-build.yml@main
+    uses: ./.github/workflows/seed-build.yml
     with:
       ref: ${{ github.sha }}
       build_type: daily-build
